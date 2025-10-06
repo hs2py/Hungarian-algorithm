@@ -1,1 +1,127 @@
+import cv2
+import numpy as np
+import math
 
+
+def compute_HOG(gray, cell_size=8, block_size=2, bins=9):
+    # Sobel로 gradient 계산
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=1)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=1)
+
+    magnitude, angle = cv2.cartToPolar(gx, gy, angleInDegrees=True)
+    angle[angle >= 180] -= 180  # 0~180도 제한
+
+    h, w = gray.shape
+    cell_x = w // cell_size
+    cell_y = h // cell_size
+
+    # 셀 히스토그램
+    hist = np.zeros((cell_y, cell_x, bins), dtype=np.float32)
+    bin_width = 180 / bins
+
+    for i in range(cell_y):
+        for j in range(cell_x):
+            cell_mag = magnitude[i*cell_size:(i+1)*cell_size, j*cell_size:(j+1)*cell_size]
+            cell_ang = angle[i*cell_size:(i+1)*cell_size, j*cell_size:(j+1)*cell_size]
+            for y in range(cell_mag.shape[0]):
+                for x in range(cell_mag.shape[1]):
+                    bin_idx = int(cell_ang[y, x] // bin_width)
+                    bin_idx = min(bin_idx, bins - 1)
+                    hist[i, j, bin_idx] += cell_mag[y, x]
+
+    # 블록 정규화
+    n_blocks_y = cell_y - block_size + 1
+    n_blocks_x = cell_x - block_size + 1
+    hog_vector = []
+    for y in range(n_blocks_y):
+        for x in range(n_blocks_x):
+            block = hist[y:y+block_size, x:x+block_size, :].ravel()
+            norm = np.sqrt(np.sum(block**2) + 1e-6)
+            block = block / norm
+            hog_vector.extend(block)
+
+    return np.array(hog_vector, dtype=np.float32)
+
+
+
+from sklearn.svm import LinearSVC
+
+def train_SVM(pos_imgs, neg_imgs):
+    data = []
+    labels = []
+
+    for img in pos_imgs:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (64, 128))
+        data.append(compute_HOG(gray))
+        labels.append(1)
+
+    for img in neg_imgs:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (64, 128))
+        data.append(compute_HOG(gray))
+        labels.append(0)
+
+    clf = LinearSVC()
+    clf.fit(data, labels)
+    return clf
+
+
+def detect_multiscale(img, clf, cell_size=8, block_size=2,
+                      win_size=(64,128), scale=1.05,
+                      stride=8, bins=9, threshold=0.5):
+
+    detections = []
+    scores = []
+
+    gray_original = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray_original.shape
+    current_scale = 1.0
+
+    while True:
+        new_w = int(w / current_scale)
+        new_h = int(h / current_scale)
+        if new_w < win_size[0] or new_h < win_size[1]:
+            break
+
+        resized = cv2.resize(gray_original, (new_w, new_h))
+        for y in range(0, new_h - win_size[1], stride):
+            for x in range(0, new_w - win_size[0], stride):
+                window = resized[y:y+win_size[1], x:x+win_size[0]]
+                feature = compute_HOG(window, cell_size, block_size, bins)
+                score = clf.decision_function([feature])[0]
+                if score > threshold:
+                    rx = int(x * current_scale)
+                    ry = int(y * current_scale)
+                    rw = int(win_size[0] * current_scale)
+                    rh = int(win_size[1] * current_scale)
+                    detections.append([rx, ry, rw, rh])
+                    scores.append(float(score))
+        current_scale *= scale
+
+    # NMS 적용
+    indices = cv2.dnn.NMSBoxes(detections, scores, threshold, 0.5)
+    final_dets = [detections[i[0]] for i in indices] if len(indices) > 0 else []
+    return final_dets
+
+
+if __name__ == "__main__":
+    # 1. 데이터 불러오기 (직접 준비 필요)
+    # pos_imgs: 사람 이미지 리스트
+    # neg_imgs: 비사람 이미지 리스트
+    pos_imgs = [cv2.imread(f"pos/{i}.jpg") for i in range(1, 21)]
+    neg_imgs = [cv2.imread(f"neg/{i}.jpg") for i in range(1, 21)]
+
+    # 2. SVM 학습
+    clf = train_SVM(pos_imgs, neg_imgs)
+
+    # 3. 테스트 이미지 탐지
+    img = cv2.imread("test.jpg")
+    detections = detect_multiscale(img, clf)
+
+    # 4. 시각화
+    for (x, y, w, h) in detections:
+        cv2.rectangle(img, (x, y), (x+w, y+h), (0,255,0), 2)
+    cv2.imshow("Detection", img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
